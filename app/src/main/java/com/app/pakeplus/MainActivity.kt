@@ -1528,6 +1528,45 @@ class MainActivity : AppCompatActivity() {
                   });
                 }
 
+                function installAndroidCacheErrorInvalidation() {
+                  if (window.__splayerAndroidCacheErrorInvalidationPatched) return;
+                  window.__splayerAndroidCacheErrorInvalidationPatched = true;
+                  var invalidated = {};
+                  function isAndroidCachedMediaUrl(value) {
+                    var raw = String(value || '');
+                    if (!raw) return false;
+                    if (raw.indexOf('/android-cache/') >= 0) return true;
+                    if (!/^file:/i.test(raw)) return false;
+                    try {
+                      var decoded = decodeURIComponent(raw).replace(/\\/g, '/');
+                      return decoded.indexOf('SPlayerCache') >= 0 && decoded.indexOf('/music/') >= 0;
+                    } catch (e) {
+                      return raw.indexOf('SPlayerCache') >= 0;
+                    }
+                  }
+                  function isMediaElement(el) {
+                    try {
+                      return !!(el && window.HTMLMediaElement && el instanceof HTMLMediaElement);
+                    } catch (e) {
+                      return false;
+                    }
+                  }
+                  document.addEventListener('error', function (event) {
+                    try {
+                      var el = event && event.target;
+                      if (!isMediaElement(el)) return;
+                      var url = el.currentSrc || el.src || '';
+                      if (!isAndroidCachedMediaUrl(url)) return;
+                      if (invalidated[url]) return;
+                      invalidated[url] = Date.now();
+                      var code = el.error && el.error.code ? el.error.code : 0;
+                      androidBridgeLog('AndroidMusicCache', 'invalidate cached media after element error code=' + code + ' url=' + String(url).slice(0, 220));
+                      androidInvoke('music-cache-invalidate', [url, 'media_element_error_' + code]);
+                    } catch (e) {}
+                  }, true);
+                }
+                installAndroidCacheErrorInvalidation();
+
                 function chooseDirectory() {
                   return new Promise(function (resolve) {
                     var id = 'android_dir_' + Date.now() + '_' + Math.random().toString(36).slice(2);
@@ -1594,6 +1633,7 @@ class MainActivity : AppCompatActivity() {
                     var androidChannels = {
                       'music-cache-check': true,
                       'music-cache-download': true,
+                      'music-cache-invalidate': true,
                       'cache-list': true,
                       'cache-remove': true,
                       'cache-clear': true,
@@ -2016,6 +2056,11 @@ class MainActivity : AppCompatActivity() {
                 val quality = args.optStringOrNull(2)
                 val path = androidMusicCache.cacheMusic(id, url, quality, webViewUserAgent)
                 JSONObject().put("success", true).put("path", path).toString()
+            }
+            "music-cache-invalidate" -> {
+                val target = args.optStringOrNull(0)
+                val reason = args.optStringOrNull(1)
+                cacheSuccess(androidMusicCache.invalidatePlayablePath(target, reason))
             }
             "cache-size" -> cacheSuccess(androidMusicCache.getSize())
             "cache-clear-all" -> {

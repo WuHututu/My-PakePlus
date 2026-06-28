@@ -51,6 +51,11 @@ class AndroidMusicCache(private val context: Context) {
         }
 
         for (file in candidates) {
+            if (!validateCachedMusicFile(file)) {
+                deleteBadCache(file, "cache_validation_failed")
+                continue
+            }
+
             if (expectedMd5.isNullOrBlank()) {
                 file.setLastModified(System.currentTimeMillis())
                 return playablePath(file)
@@ -104,6 +109,11 @@ class AndroidMusicCache(private val context: Context) {
                     tmp.delete()
                     throw IllegalStateException("Downloaded cache file is empty")
                 }
+                if (!validateCachedMusicFile(tmp)) {
+                    val bytes = tmp.length()
+                    tmp.delete()
+                    throw IllegalStateException("Downloaded cache file is not a playable audio payload, bytes=$bytes")
+                }
                 if (target.exists()) target.delete()
                 if (!tmp.renameTo(target)) {
                     FileInputStream(tmp).use { input ->
@@ -132,7 +142,25 @@ class AndroidMusicCache(private val context: Context) {
         } else {
             File(path).canonicalFile
         }
-        return if (target.path.startsWith(root.path) && target.isFile && target.length() > 0L) target else null
+        if (!target.path.startsWith(root.path) || !target.isFile) return null
+        if (!validateCachedMusicFile(target)) {
+            deleteBadCache(target, "resolve_playable_invalid")
+            return null
+        }
+        target.setLastModified(System.currentTimeMillis())
+        return target
+    }
+
+    fun invalidatePlayablePath(pathOrUri: String?, reason: String?): Boolean {
+        ensureDirs()
+        val target = resolveMusicFileForInvalidation(pathOrUri) ?: return false
+        val bytes = target.length()
+        val deleted = target.delete()
+        Log.w(
+            "AndroidMusicCache",
+            "cache invalidated reason=${reason.orEmpty()} path=${target.absolutePath} bytes=$bytes deleted=$deleted"
+        )
+        return deleted
     }
 
     fun getSize(): Long {
@@ -275,6 +303,124 @@ class AndroidMusicCache(private val context: Context) {
         return if (target.path.startsWith(root.path)) target else null
     }
 
+    private fun resolveMusicFileForInvalidation(pathOrUri: String?): File? {
+        val raw = pathOrUri?.trim().orEmpty()
+        if (raw.isBlank()) return null
+        val root = musicDir().canonicalFile
+        val target = runCatching {
+            val parsed = Uri.parse(raw)
+            when {
+                parsed.scheme.equals("file", ignoreCase = true) -> {
+                    val path = parsed.path ?: return null
+                    File(path).canonicalFile
+                }
+                raw.startsWith("/android-cache/", ignoreCase = true) -> {
+                    val name = raw.substringAfterLast('/').substringBefore('?').substringBefore('#')
+                    File(root, name).canonicalFile
+                }
+                else -> File(raw).canonicalFile
+            }
+        }.getOrNull() ?: return null
+        return if (target.path.startsWith(root.path) && target.isFile) target else null
+    }
+
+    private fun validateCachedMusicFile(file: File): Boolean {
+        val reason = invalidCachedMusicReason(file)
+        if (reason != null) {
+            Log.w(
+                "AndroidMusicCache",
+                "invalid cache file reason=$reason path=${file.absolutePath} bytes=${file.length()}"
+            )
+            return false
+        }
+        return true
+    }
+
+    private fun invalidCachedMusicReason(file: File): String? {
+        if (!file.isFile) return "not_file"
+        if (file.name.endsWith(".tmp", ignoreCase = true)) return "tmp_file"
+        val length = file.length()
+        if (length <= 0L) return "empty"
+        if (length < MIN_VALID_AUDIO_CACHE_BYTES) return "too_small:$length"
+        val sampleSize = minOf(AUDIO_SNIFF_BYTES.toLong(), length).toInt()
+        val head = ByteArray(sampleSize)
+        val read = try {
+            FileInputStream(file).use { it.read(head) }
+        } catch (e: Exception) {
+            Log.w("AndroidMusicCache", "read cache header failed: ${file.absolutePath}", e)
+            return "unreadable_header"
+        }
+        if (read <= 0) return "empty_header"
+        if (looksLikeTextErrorPayload(head, read)) return "text_error_payload"
+        return null
+    }
+
+    private fun looksLikeTextErrorPayload(buffer: ByteArray, read: Int): Boolean {
+        val sample = String(buffer, 0, read, Charsets.ISO_8859_1)
+        val lower = sample
+            .trimStart('\uFEFF', '\u0000', ' ', '\n', '\r', '\t')
+            .take(512)
+            .lowercase(Locale.ROOT)
+        if (lower.startsWith("<!doctype") || lower.startsWith("<html") || lower.startsWith("<?xml") || lower.startsWith("<body")) {
+            return true
+        }
+        if ((lower.startsWith("{") || lower.startsWith("[")) &&
+            listOf("\"code\"", "\"error\"", "\"message\"", "\"status\"", "forbidden", "not found").any { lower.contains(it) }
+        ) {
+            return true
+        }
+        val printable = buffer.take(read).count {
+            val b = it.toInt() and 0xff
+            b == 9 || b == 10 || b == 13 || b in 32..126
+        }
+        val looksText = read >= 64 && printable.toDouble() / read.toDouble() > 0.92
+        if (looksText && listOf(
+                "error",
+                "forbidden",
+                "not found",
+                "access denied",
+                "bad gateway",
+                "service unavailable",
+                "unauthorized",
+                "too many requests"
+            ).any { lower.contains(it) }
+        ) {
+            return true
+        }
+        return false
+    }
+
+    private fun deleteBadCache(file: File, reason: String) {
+        val bytes = file.length()
+        val deleted = runCatching { file.delete() }.getOrDefault(false)
+        Log.w("AndroidMusicCache", "bad cache removed reason=$reason path=${file.absolutePath} bytes=$bytes deleted=$deleted")
+    }
+
+    private fun isDefinitelyInvalidAudioContentType(contentType: String?): Boolean {
+        val type = contentType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase(Locale.ROOT)
+            .orEmpty()
+        if (type.isBlank()) return false
+        if (type.startsWith("audio/")) return false
+        if (type == "application/octet-stream" || type == "binary/octet-stream" || type == "video/mp4") return false
+        return type.startsWith("text/") || type in setOf(
+            "application/json",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/javascript",
+            "application/problem+json"
+        )
+    }
+
+    private fun readSmallResponseBody(connection: HttpURLConnection): String? {
+        return runCatching {
+            val stream = if (connection.responseCode >= 400) connection.errorStream else connection.inputStream
+            stream?.bufferedReader()?.use { it.readText().take(512) }
+        }.getOrNull()
+    }
+
     private fun inferExtension(sourceUrl: String): String {
         val path = runCatching { Uri.parse(sourceUrl).path.orEmpty().lowercase(Locale.ROOT) }
             .getOrDefault(sourceUrl.lowercase(Locale.ROOT))
@@ -346,8 +492,29 @@ class AndroidMusicCache(private val context: Context) {
                     )
                     throw IllegalStateException("HTTP $code")
                 }
+                if (isDefinitelyInvalidAudioContentType(connection.contentType)) {
+                    val bodyPreview = readSmallResponseBody(connection)
+                    Log.e(
+                        "AndroidMusicCache",
+                        "download rejected invalid content-type url=$currentUrl type=${connection.contentType} body=$bodyPreview"
+                    )
+                    throw IllegalStateException("Invalid audio content-type: ${connection.contentType}")
+                }
                 val copiedBytes = connection.inputStream.use { input ->
                     FileOutputStream(target).use { output -> input.copyTo(output) }
+                }
+                val expectedLength = connection.contentLengthLong
+                if (expectedLength > 0L && target.length() < expectedLength) {
+                    Log.e(
+                        "AndroidMusicCache",
+                        "download truncated url=$currentUrl expected=$expectedLength actual=${target.length()} file=${target.absolutePath}"
+                    )
+                    target.delete()
+                    throw IllegalStateException("Downloaded cache file is truncated")
+                }
+                if (!validateCachedMusicFile(target)) {
+                    target.delete()
+                    throw IllegalStateException("Downloaded cache file failed validation")
                 }
                 Log.i(
                     "AndroidMusicCache",
@@ -408,6 +575,8 @@ class AndroidMusicCache(private val context: Context) {
     companion object {
         private const val DEFAULT_UA =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Mobile Safari/537.36"
+        private const val MIN_VALID_AUDIO_CACHE_BYTES = 32L * 1024L
+        private const val AUDIO_SNIFF_BYTES = 4096
     }
 }
 
