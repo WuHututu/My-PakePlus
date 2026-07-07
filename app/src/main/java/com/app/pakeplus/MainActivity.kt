@@ -592,6 +592,18 @@ class MainActivity : AppCompatActivity() {
                     updateMediaPlayback(false, true)
                 }
 
+                override fun onSkipToNext() {
+                    clearExternalAudioSuppression()
+                    controlWebMedia("next")
+                    updateMediaPlayback(true, true)
+                }
+
+                override fun onSkipToPrevious() {
+                    clearExternalAudioSuppression()
+                    controlWebMedia("prev")
+                    updateMediaPlayback(true, true)
+                }
+
                 override fun onStop() {
                     clearExternalAudioSuppression()
                     controlWebMedia("pause")
@@ -620,6 +632,8 @@ class MainActivity : AppCompatActivity() {
                     when (event.keyCode) {
                         KeyEvent.KEYCODE_MEDIA_PLAY -> onPlay()
                         KeyEvent.KEYCODE_MEDIA_PAUSE -> onPause()
+                        KeyEvent.KEYCODE_MEDIA_NEXT -> onSkipToNext()
+                        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> onSkipToPrevious()
                         KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                             clearExternalAudioSuppression()
                             controlWebMedia("toggle")
@@ -658,20 +672,56 @@ class MainActivity : AppCompatActivity() {
         val script = """
             (function(){
               var action = "$action";
-              var player = window.__SPLAYER_PLAYER_CONTROLLER__ || null;
-              if (player) {
-                if (action === "play" && typeof player.play === "function") { player.play(); return; }
-                if (action === "pause" && typeof player.pause === "function") { player.pause(); return; }
-                if (action === "toggle" && typeof player.playOrPause === "function") { player.playOrPause(); return; }
+              function unique(list) {
+                return list.filter(function (item, index, arr) { return item && arr.indexOf(item) === index; });
               }
-              var media = Array.prototype.slice.call(document.querySelectorAll('audio,video'))
-                .filter(function(el){ return el && !isNaN(el.duration); })[0];
+              function allMedia() {
+                var tracked = [];
+                try {
+                  var registry = window.__SPLAYER_ANDROID_MEDIA_ELEMENTS__ || [];
+                  if (typeof registry.forEach === 'function') registry.forEach(function (el) { tracked.push(el); });
+                  else if (Array.isArray(registry)) tracked = registry.slice();
+                } catch (e) {}
+                return unique(tracked.concat(Array.prototype.slice.call(document.querySelectorAll('audio,video'))));
+              }
+              function hasSource(el) {
+                try { return !!(el && (el.currentSrc || el.src || el.getAttribute && el.getAttribute('src'))); } catch (e) { return false; }
+              }
+              function pauseElement(el) {
+                try { if (el && el.pause) el.pause(); } catch (e) {}
+              }
+              function pauseAll() {
+                allMedia().forEach(pauseElement);
+              }
+              function firstUsableMedia() {
+                var list = allMedia().filter(function (el) { return el && (hasSource(el) || !isNaN(el.duration)); });
+                return list.filter(function (el) { return el && !el.paused && !el.ended; })[0] || list[0] || null;
+              }
+              var player = window.__SPLAYER_PLAYER_CONTROLLER__ || null;
+              var hadActiveMedia = allMedia().some(function (el) { return el && !el.paused && !el.ended; });
+              try {
+                if ((action === "next" || action === "prev") && player && typeof player.nextOrPrev === "function") {
+                  pauseAll();
+                  player.nextOrPrev(action === "next" ? "next" : "prev", true);
+                  return;
+                }
+                if (player) {
+                  if (action === "play" && typeof player.play === "function") { player.play(); return; }
+                  if (action === "pause" && typeof player.pause === "function") { player.pause(); pauseAll(); return; }
+                  if (action === "toggle" && typeof player.playOrPause === "function") {
+                    player.playOrPause();
+                    if (hadActiveMedia) pauseAll();
+                    return;
+                  }
+                }
+              } catch (e) {}
+              var media = firstUsableMedia();
               if (!media) return;
               if (action === "play") media.play && media.play();
-              if (action === "pause") media.pause && media.pause();
+              if (action === "pause") pauseAll();
               if (action === "toggle") {
                 if (media.paused) media.play && media.play();
-                else media.pause && media.pause();
+                else pauseAll();
               }
             })();
         """.trimIndent()
@@ -1162,18 +1212,23 @@ class MainActivity : AppCompatActivity() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val toggleIntent = PendingIntent.getBroadcast(
-            this,
+        fun mediaButtonIntent(requestCode: Int, keyCode: Int): PendingIntent {
+            return PendingIntent.getBroadcast(
+                this,
+                requestCode,
+                Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(
+                    Intent.EXTRA_KEY_EVENT,
+                    KeyEvent(KeyEvent.ACTION_UP, keyCode)
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+        val previousIntent = mediaButtonIntent(2, KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        val toggleIntent = mediaButtonIntent(
             1,
-            Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(
-                Intent.EXTRA_KEY_EVENT,
-                KeyEvent(
-                    KeyEvent.ACTION_UP,
-                    if (isPlaying) KeyEvent.KEYCODE_MEDIA_PAUSE else KeyEvent.KEYCODE_MEDIA_PLAY
-                )
-            ),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            if (isPlaying) KeyEvent.KEYCODE_MEDIA_PAUSE else KeyEvent.KEYCODE_MEDIA_PLAY
         )
+        val nextIntent = mediaButtonIntent(3, KeyEvent.KEYCODE_MEDIA_NEXT)
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, MEDIA_CHANNEL_ID)
         } else {
@@ -1192,12 +1247,22 @@ class MainActivity : AppCompatActivity() {
             .setStyle(
                 Notification.MediaStyle()
                     .setMediaSession(session.sessionToken)
-                    .setShowActionsInCompactView(0)
+                    .setShowActionsInCompactView(0, 1, 2)
+            )
+            .addAction(
+                android.R.drawable.ic_media_previous,
+                "Previous",
+                previousIntent
             )
             .addAction(
                 if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
                 if (isPlaying) "Pause" else "Play",
                 toggleIntent
+            )
+            .addAction(
+                android.R.drawable.ic_media_next,
+                "Next",
+                nextIntent
             )
         mediaArtworkBitmap?.let { notificationBuilder.setLargeIcon(it) }
         val notification = notificationBuilder.build()
